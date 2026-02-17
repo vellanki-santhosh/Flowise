@@ -8,6 +8,16 @@ import { StatusCodes } from 'http-status-codes'
 import { getRunningExpressApp } from '../../utils/getRunningExpressApp'
 import { v4 as uuidv4 } from 'uuid'
 import { getErrorMessage } from '../../errors/utils'
+
+// 1. Add a wrapper to enforce timeouts on the prediction
+const withTimeout = (promise: Promise<any>, ms: number) => {
+    return Promise.race([
+        promise,
+        new Promise((_, reject) =>
+            setTimeout(() => reject(new Error(`Operation timed out after ${ms}ms`)), ms)
+        )
+    ]);
+};
 import { MODE } from '../../Interface'
 
 // Send input message and get prediction result (External)
@@ -76,19 +86,44 @@ const createPrediction = async (req: Request, res: Response, next: NextFunction)
                         getRunningExpressApp().redisSubscriber.subscribe(chatId)
                     }
 
-                    const apiResponse = await predictionsServices.buildChatflow(req)
+                    // 2. Wrap the core prediction logic in a timeout
+                    const apiResponse = await withTimeout(
+                        predictionsServices.buildChatflow(req),
+                        60000 // 60s timeout
+                    )
                     sseStreamer.streamMetadataEvent(apiResponse.chatId, apiResponse)
                 } catch (error) {
+                    console.error('[Prediction Error]:', error);
                     if (chatId) {
                         sseStreamer.streamErrorEvent(chatId, getErrorMessage(error))
                     }
-                    next(error)
+                    // 4. Return a proper error to the client so the UI stops loading
+                    return res.status(500).json({
+                        success: false,
+                        message: getErrorMessage(error),
+                        stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+                    });
                 } finally {
                     sseStreamer.removeClient(chatId)
                 }
             } else {
-                const apiResponse = await predictionsServices.buildChatflow(req)
-                return res.json(apiResponse)
+                try {
+                    // 2. Wrap the core prediction logic in a timeout
+                    const apiResponse = await withTimeout(
+                        predictionsServices.buildChatflow(req),
+                        60000 // 60s timeout
+                    )
+                    // 3. Ensure we actually send a response
+                    return res.json(apiResponse)
+                } catch (error) {
+                    console.error('[Prediction Error]:', error);
+                    // 4. Return a proper error to the client so the UI stops loading
+                    return res.status(500).json({
+                        success: false,
+                        message: getErrorMessage(error),
+                        stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+                    });
+                }
             }
         } else {
             const isStreamingRequested = req.body.streaming === 'true' || req.body.streaming === true
@@ -98,7 +133,13 @@ const createPrediction = async (req: Request, res: Response, next: NextFunction)
             throw new InternalFlowiseError(StatusCodes.FORBIDDEN, unauthorizedOriginError)
         }
     } catch (error) {
-        next(error)
+        console.error('[Prediction Error]:', error);
+        // 4. Return a proper error to the client so the UI stops loading
+        return res.status(500).json({
+            success: false,
+            message: getErrorMessage(error),
+            stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+        });
     }
 }
 
